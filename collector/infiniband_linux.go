@@ -10,7 +10,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 // +build linux
 // +build !noinfiniband
 
@@ -18,10 +17,12 @@ package collector
 
 import (
 	"errors"
-	"path/filepath"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"io/ioutil"
+	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 const infinibandPath = "class/infiniband"
@@ -34,6 +35,7 @@ var (
 type infinibandCollector struct {
 	metricDescs map[string]*prometheus.Desc
 	counters    map[string]infinibandMetric
+	states      map[string]infinibandMetric
 }
 
 type infinibandMetric struct {
@@ -60,10 +62,23 @@ func NewInfiniBandCollector() (Collector, error) {
 		"unicast_packets_transmitted_total":   {"unicast_xmit_packets", "Number of unicast packets transmitted (including errors)"},
 	}
 
+	i.states = map[string]infinibandMetric{
+		"rate_bytes_per_second": {"rate", "Ideal rate for the InfiniBand interface in bytes per second"},
+	}
+
 	subsystem := "infiniband"
 	i.metricDescs = make(map[string]*prometheus.Desc)
 
 	for metricName, infinibandMetric := range i.counters {
+		i.metricDescs[metricName] = prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, metricName),
+			infinibandMetric.Help,
+			[]string{"device", "port"},
+			nil,
+		)
+	}
+
+	for metricName, infinibandMetric := range i.states {
 		i.metricDescs[metricName] = prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, metricName),
 			infinibandMetric.Help,
@@ -127,6 +142,36 @@ func readMetric(directory, metricFile string) (uint64, error) {
 	return metric, nil
 }
 
+func parseInfiniBandRate(directory, metricFile string) (int, error) {
+	metric, err := ioutil.ReadFile(filepath.Join(directory, metricFile))
+	if err != nil {
+		log.Debugf("Error reading %q file", metricFile)
+		return 0, err
+	}
+	metricFields := strings.Fields(string(metric))
+
+	rate := metricFields[0]
+	rateInt, err := strconv.Atoi(rate)
+
+	if err != nil {
+		return 0, err
+	}
+
+	unit := metricFields[1]
+
+	switch unit {
+	case "Gb/sec":
+		rateInt *= 1024 * 1024 * 1024
+	case "Mb/sec":
+		rateInt *= 1024 * 1024
+	case "Kb/sec":
+		rateInt *= 1024
+	}
+
+	return rateInt, nil
+
+}
+
 func (c *infinibandCollector) Update(ch chan<- prometheus.Metric) (err error) {
 	devices, err := infinibandDevices(sysFilePath(infinibandPath))
 
@@ -158,6 +203,21 @@ func (c *infinibandCollector) Update(ch chan<- prometheus.Metric) (err error) {
 			// Add metrics for the InfiniBand counters.
 			for metricName, infinibandMetric := range c.counters {
 				metric, err := readMetric(filepath.Join(portFiles, "counters"), infinibandMetric.File)
+				if err != nil {
+					return err
+				}
+
+				ch <- prometheus.MustNewConstMetric(
+					c.metricDescs[metricName],
+					prometheus.CounterValue,
+					float64(metric),
+					device,
+					port,
+				)
+			}
+
+			for metricName, infinibandMetric := range c.states {
+				metric, err := parseInfiniBandRate(portFiles, infinibandMetric.File)
 				if err != nil {
 					return err
 				}
